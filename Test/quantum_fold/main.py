@@ -94,7 +94,7 @@ def _run_real(args):
         list_real_benchmarks,
     )
     from quantum_fold.algorithms.hybrid_pipeline import HybridPipeline
-    from quantum_fold.utils.pdb_io import write_ca_pdb, fetch_pdb, parse_pdb
+    from quantum_fold.utils.pdb_io import write_ca_pdb, write_backbone_pdb, fetch_pdb, parse_pdb
     from quantum_fold.utils.metrics import print_metrics
 
     if args.list_benchmarks:
@@ -163,14 +163,28 @@ def _run_real(args):
         result = pipeline.run()
         all_results[method] = result
 
-        # Export predicted structure
-        pred_coords = result["predicted_coords"]
-        filename = f"{args.outdir}/predicted_{method}_{seq[:10]}.pdb"
-        write_ca_pdb(pred_coords, seq, filename, remarks=[
-            f"Method: {method}",
-            f"Energy: {result['total_energy']:.3f}",
-        ])
-        print(f"  Exported PDB: {filename}")
+        # Export predicted structure (Detailed Backbone + CB)
+        if "predicted_backbone" in result:
+            filename = f"{args.outdir}/predicted_{method}_{seq[:10]}_full.pdb"
+            write_backbone_pdb(
+                result["predicted_backbone"], seq,
+                cb_coords=result.get("predicted_cb"),
+                filename=filename,
+                confidence=result.get("confidence_scores"),
+                remarks=[
+                    f"Method: {method}",
+                    f"Energy: {result['total_energy']:.3f}",
+                ]
+            )
+            print(f"  Exported Detailed PDB: {filename}")
+        else:
+            pred_coords = result["predicted_coords"]
+            filename = f"{args.outdir}/predicted_{method}_{seq[:10]}.pdb"
+            write_ca_pdb(pred_coords, seq, filename, b_factors=result.get("confidence_scores"), remarks=[
+                f"Method: {method}",
+                f"Energy: {result['total_energy']:.3f}",
+            ])
+            print(f"  Exported CA PDB: {filename}")
 
         # Generate high-res 3D Visualisations
         try:

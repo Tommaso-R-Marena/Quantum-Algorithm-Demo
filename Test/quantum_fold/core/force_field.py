@@ -31,7 +31,7 @@ References:
 from __future__ import annotations
 
 import numpy as np
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 from .residue import HYDROPHOBICITY, VDW_RADIUS, STANDARD_AAS, AA_1TO3
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -179,36 +179,43 @@ def dfire2_potential(
     sequence: str,
     cutoff: float = 15.0,
     min_seq_sep: int = 3,
-) -> float:
+) -> Union[float, Tuple[float, np.ndarray]]:
     """
     DFIRE2-type distance-dependent contact potential.
-
-    E = Σ_{|i-j|≥s} e(a_i, a_j, d_ij)
-    where e(a,b,d) = MJ(a,b) * g(d) and g(d) is a distance-dependent
-    weighting function based on the ideal gas reference:
-      g(d) = (d_cut / d)^α   for d < d_cut
-    with α = 1.61 (Yang & Zhou, 2008).
+    Now with analytical gradient support.
     """
     n = len(ca_coords)
     energy = 0.0
-    alpha = 1.61  # DFIRE2 exponent
+    alpha = 1.61
+    grad = np.zeros_like(ca_coords)
 
     for i in range(n):
         for j in range(i + min_seq_sep, n):
-            d = np.linalg.norm(ca_coords[i] - ca_coords[j])
+            vec = ca_coords[i] - ca_coords[j]
+            d = np.linalg.norm(vec)
             if d > cutoff or d < 1.0:
                 continue
 
-            # Distance-dependent reference state
-            g = (cutoff / d) ** alpha - 1.0
-
+            # e(d) = eps * ((cutoff/d)^alpha - 1)
             aa_i = sequence[i] if i < len(sequence) else "A"
             aa_j = sequence[j] if j < len(sequence) else "A"
             eps = mj_contact_energy(aa_i, aa_j)
 
+            ratio = cutoff / d
+            g = ratio ** alpha - 1.0
             energy += eps * g
 
-    return energy
+            # de/dd = eps * alpha * (cutoff/d)^(alpha-1) * (-cutoff/d^2)
+            #       = -eps * alpha * cutoff^alpha / d^(alpha+1)
+            de_dd = -eps * alpha * (cutoff ** alpha) / (d ** (alpha + 1))
+
+            # de/dri = de/dd * (ri - rj) / d
+            d_inv = 1.0 / (d + 1e-12)
+            d_grad = de_dd * vec * d_inv
+            grad[i] += d_grad
+            grad[j] -= d_grad
+
+    return (energy, grad)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -221,18 +228,7 @@ def hbond_energy_dssp(
 ) -> float:
     """
     DSSP-like backbone hydrogen bond energy.
-
-    A hydrogen bond exists between C=O of residue i and N-H of residue j
-    when the electrostatic energy of the N-H···O=C interaction is
-    sufficiently negative.
-
-    Using Kabsch-Sander formula:
-      E_hb = 0.084 * {332} * q1*q2 * (1/r_ON + 1/r_CH - 1/r_OH - 1/r_CN)
-
-    Simplified for Cα-level:
-      We approximate O and H positions from backbone geometry.
-      O is placed at C + 1.231 Å along C=O (perpendicular to N-Cα-C plane)
-      H is placed at N + 1.02 Å along N-H (opposite to Cα direction)
+    (Analytical gradient not implemented due to complex geometry)
     """
     n_res = len(backbone) // 3
     if n_res < 5:
@@ -275,8 +271,6 @@ def hbond_energy_dssp(
                 continue
 
             # Kabsch-Sander electrostatic energy
-            # E = 0.084 * 332 * (-0.20 * 0.20) * (1/rON + 1/rCH - 1/rOH - 1/rCN)
-            # Charges: q_C = +0.42e, q_O = -0.42e, q_N = -0.20e, q_H = +0.20e
             e_hb = 0.084 * 332.0 * 0.42 * 0.20 * (
                 1.0 / (r_on + 0.1) + 1.0 / (r_ch + 0.1)
                 - 1.0 / (r_oh + 0.1) - 1.0 / (r_cn + 0.1)
@@ -299,13 +293,6 @@ def torsional_energy(
 ) -> float:
     """
     Torsional energy as a Fourier series fit to Ramachandran statistics.
-
-    V(φ,ψ) = Σ_n [a_n * cos(nφ) + b_n * sin(nφ)]
-           + Σ_n [c_n * cos(nψ) + d_n * sin(nψ)]
-           + coupling terms
-
-    Parameters from PDB survey of 12,000 high-resolution structures
-    (Molprobity validated).
     """
     n = len(phi)
     energy = 0.0
@@ -338,8 +325,6 @@ def torsional_energy(
             e += 1.5 * (1 - np.cos(q - 2.53))
         else:
             # General residue: two-well potential (αR and β basins)
-            # Basin 1: αR (φ=-60°, ψ=-45°) → (φ=-1.05, ψ=-0.79)
-            # Basin 2: β  (φ=-120°, ψ=130°) → (φ=-2.09, ψ=2.27)
             e_alpha = (p + 1.05) ** 2 / (2 * 0.35 ** 2) + (q + 0.79) ** 2 / (2 * 0.35 ** 2)
             e_beta = (p + 2.09) ** 2 / (2 * 0.50 ** 2) + (q - 2.27) ** 2 / (2 * 0.40 ** 2)
             e_ppii = (p + 1.31) ** 2 / (2 * 0.40 ** 2) + (q - 2.53) ** 2 / (2 * 0.35 ** 2)
@@ -366,28 +351,21 @@ def lennard_jones_energy(
     sequence: str,
     min_seq_sep: int = 2,
     cutoff: float = 12.0,
-) -> float:
+) -> Union[float, Tuple[float, np.ndarray]]:
     """
     Soft-Core Lennard-Jones potential with residue-specific σ.
-
-    Classic V_LJ(r) blows up to infinity as r → 0, causing numerical instability
-    during sampling and refinement (can yield 10^7 kcal/mol). We use a soft-core
-    formulation (Beutler et al., 1994) to bound the maximum repulsion.
-
-    V_soft(r) = 4ε * [ 1 / (α + (r/σ)^6)^2  -  1 / (α + (r/σ)^6) ]
-
-    ε = 0.2 kcal/mol (uniform)
-    α = 0.1 (soft-core parameter, max energy bounds to ~4ε/α² ≈ 80 kcal/mol)
-    σ_ij = (σ_i + σ_j) / 2
+    Now with analytical gradient support.
     """
     n = len(ca_coords)
-    eps = 0.2
-    alpha = 0.1  # Core softening parameter
+    eps_val = 0.2
+    alpha = 0.1
     energy = 0.0
+    grad = np.zeros_like(ca_coords)
 
     for i in range(n):
         for j in range(i + min_seq_sep, n):
-            d = np.linalg.norm(ca_coords[i] - ca_coords[j])
+            vec = ca_coords[i] - ca_coords[j]
+            d = np.linalg.norm(vec)
             if d > cutoff:
                 continue
 
@@ -396,14 +374,21 @@ def lennard_jones_energy(
             sigma = (SIGMA_VDW.get(aa_i, 3.8) + SIGMA_VDW.get(aa_j, 3.8)) / 2.0
 
             # Soft-core formulation
-            r6_scaled = (d / sigma) ** 6
-            denom = alpha + r6_scaled
-            
-            # Attractive part: -1 / denom
-            # Repulsive part: 1 / denom^2
-            energy += 4.0 * eps * (1.0 / (denom ** 2) - 1.0 / denom)
+            u = (d / sigma) ** 6
+            denom = alpha + u
 
-    return energy
+            # energy = 4.0 * eps * (1.0 / (denom ** 2) - 1.0 / denom)
+            energy += 4.0 * eps_val * (1.0 / (denom ** 2) - 1.0 / denom)
+
+            # dv/dd = (24*eps*u / (d * denom^2)) * (1 - 2/denom)
+            d_inv = 1.0 / (d + 1e-12)
+            dv_dd = (24.0 * eps_val * u / (d * (denom ** 2) + 1e-12)) * (1.0 - 2.0 / denom)
+
+            d_grad = dv_dd * vec * d_inv
+            grad[i] += d_grad
+            grad[j] -= d_grad
+
+    return (energy, grad)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -416,26 +401,20 @@ def electrostatic_energy(
     ionic_strength: float = 0.15,
     temperature: float = 300.0,
     min_seq_sep: int = 3,
-) -> float:
+) -> Union[float, Tuple[float, np.ndarray]]:
     """
     Screened Coulomb (Debye-Hückel) electrostatics.
-
-    V_DH(r) = (q_i * q_j * 332) / (ε_r * r) * exp(-r / λ_D)
-
-    λ_D = sqrt(ε_r * k_B * T / (2 * N_A * e^2 * I))
-        ≈ 7.9 Å at 150 mM ionic strength, 300 K
-
-    ε_r = 80 (water dielectric)
-    332 converts from e²/Å to kcal/mol
+    Now with analytical gradient support.
     """
     n = len(ca_coords)
     eps_r = 80.0
     kB_T = 0.001987 * temperature  # kcal/mol
     debye_length = np.sqrt(eps_r * kB_T / (8 * np.pi * 0.000602 * ionic_strength))
-    # Simplified: λ_D ≈ 7.9 Å at 150 mM, 300 K
     debye_length = max(debye_length, 3.0)
 
     energy = 0.0
+    grad = np.zeros_like(ca_coords)
+
     for i in range(n):
         qi = FORMAL_CHARGE.get(sequence[i] if i < len(sequence) else "A", 0.0)
         if abs(qi) < 0.01:
@@ -445,13 +424,25 @@ def electrostatic_energy(
             if abs(qj) < 0.01:
                 continue
 
-            d = np.linalg.norm(ca_coords[i] - ca_coords[j])
+            vec = ca_coords[i] - ca_coords[j]
+            d = np.linalg.norm(vec)
             if d < 1.0 or d > 30.0:
                 continue
 
-            energy += 332.0 * qi * qj / (eps_r * d) * np.exp(-d / debye_length)
+            pref = 332.0 * qi * qj / eps_r
+            exp_term = np.exp(-d / debye_length)
+            val = (pref / d) * exp_term
+            energy += val
 
-    return energy
+            # dv/dd = -val/d - val/debye_length = -val * (1/d + 1/L)
+            d_inv = 1.0 / (d + 1e-12)
+            dv_dd = -val * (d_inv + 1.0 / debye_length)
+
+            d_grad = dv_dd * vec * d_inv
+            grad[i] += d_grad
+            grad[j] -= d_grad
+
+    return (energy, grad)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -465,11 +456,7 @@ def radius_of_gyration(ca_coords: np.ndarray) -> float:
 
 
 def rg_target(n_residues: int) -> float:
-    """
-    Expected Rg for a globular protein.
-    Rg ≈ 2.2 * N^0.395 (Å)  —  Dima & Thirumalai, J. Phys. Chem. B (2004)
-    Updated exponent from 0.38 to 0.395 based on larger dataset.
-    """
+    """Expected Rg for a globular protein: Rg ≈ 2.2 * N^0.395 (Å)"""
     return 2.2 * n_residues ** 0.395
 
 
@@ -477,11 +464,28 @@ def rg_energy(
     ca_coords: np.ndarray,
     n_residues: int,
     weight: float = 2.0,
-) -> float:
-    """Harmonic restraint: E = w * (Rg - Rg_0)² / Rg_0²"""
-    rg = radius_of_gyration(ca_coords)
+) -> Union[float, Tuple[float, np.ndarray]]:
+    """
+    Harmonic Rg restraint.
+    Now with analytical gradient support.
+    """
+    n = len(ca_coords)
+    centroid = np.mean(ca_coords, axis=0)
+    devs = ca_coords - centroid
+    sq_dists = np.sum(devs ** 2, axis=1)
+    rg_sq = np.mean(sq_dists)
+    rg = np.sqrt(rg_sq + 1e-12)
+
     rg0 = rg_target(n_residues)
-    return weight * ((rg - rg0) / rg0) ** 2
+    energy = weight * ((rg - rg0) / rg0) ** 2
+
+    # dE/dri = (dE/dRg) * (dRg/dri)
+    # dE/dRg = 2 * weight * (Rg - Rg0) / Rg0^2
+    # dRg/dri = (ri - r_centroid) / (N * Rg)
+    de_drg = 2.0 * weight * (rg - rg0) / (rg0 ** 2)
+    grad = (de_drg / (n * rg)) * devs
+
+    return (energy, grad)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -495,16 +499,10 @@ def solvation_energy(
 ) -> float:
     """
     EEF1-inspired implicit solvation.
-
-    Each residue has a reference solvation free energy ΔG_ref.
-    The effective solvation depends on the local density (burial).
-
-    E_solv = Σ_i ΔG_i * f(ρ_i)
-    where ρ_i = number of Cα neighbours within burial_cutoff
-    and f(ρ) = 1 - ρ / ρ_max (surface = 1, buried = 0).
+    (Non-differentiable step function used for burial count)
     """
     n = len(ca_coords)
-    rho_max = 16.0  # maximum expected neighbours for fully buried
+    rho_max = 16.0
     energy = 0.0
 
     for i in range(n):
@@ -519,9 +517,6 @@ def solvation_energy(
         f_surface = max(0.0, 1.0 - rho / rho_max)
         aa = sequence[i] if i < len(sequence) else "A"
         dg = SOLVATION_DG.get(aa, 0.0)
-
-        # Hydrophobic residues (dg > 0): penalise being on surface
-        # Polar residues (dg < 0): reward being on surface
         energy += dg * f_surface
 
     return energy
@@ -537,11 +532,7 @@ def cb_contact_energy(
     cutoff: float = 8.0,
     min_seq_sep: int = 3,
 ) -> float:
-    """
-    Cβ-Cβ contact energy using MJ matrix.
-    More accurate than Cα contacts because Cβ captures side-chain
-    directionality.
-    """
+    """Cβ-Cβ contact energy using MJ matrix."""
     cb_coords = place_all_cb(backbone, sequence)
     n = len(cb_coords)
     energy = 0.0
@@ -553,56 +544,13 @@ def cb_contact_energy(
                 continue
             aa_i = sequence[i] if i < len(sequence) else "A"
             aa_j = sequence[j] if j < len(sequence) else "A"
-
-            # Distance-dependent switch
             if d < 6.5:
                 w = 1.0
             else:
                 w = (cutoff - d) / (cutoff - 6.5)
-
             energy += w * mj_contact_energy(aa_i, aa_j)
 
     return energy
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Legacy API — clash_energy (used by other modules)
-# ═══════════════════════════════════════════════════════════════════════════
-
-def clash_energy(
-    ca_coords: np.ndarray,
-    sequence: str = "",
-    clash_distance: float = 3.2,
-) -> float:
-    """Soft-core repulsion for steric clashes (legacy API)."""
-    n = len(ca_coords)
-    energy = 0.0
-    for i in range(n):
-        for j in range(i + 2, n):
-            d = np.linalg.norm(ca_coords[i] - ca_coords[j])
-            if d < clash_distance:
-                overlap = (clash_distance - d) / clash_distance
-                energy += overlap ** 2
-    return energy
-
-
-def contact_energy(
-    ca_coords: np.ndarray,
-    sequence: str,
-    cutoff: float = 10.0,
-    min_seq_sep: int = 3,
-) -> float:
-    """Legacy contact energy API — redirects to DFIRE2."""
-    return dfire2_potential(ca_coords, sequence, cutoff, min_seq_sep)
-
-
-def ramachandran_score(
-    phi: np.ndarray,
-    psi: np.ndarray,
-    sequence: str = "",
-) -> float:
-    """Legacy Ramachandran API — redirects to torsional energy."""
-    return torsional_energy(phi, psi, sequence)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -610,21 +558,7 @@ def ramachandran_score(
 # ═══════════════════════════════════════════════════════════════════════════
 
 class CoarseGrainedForceField:
-    """
-    Physics-based composite scoring function.
-
-    E_total = w_dfire * E_dfire2
-            + w_hbond * E_hbond(DSSP)
-            + w_torsion * E_torsional
-            + w_lj * E_lennard_jones
-            + w_elec * E_electrostatic
-            + w_rg * E_radius_gyration
-            + w_solv * E_solvation
-            + w_cb * E_cb_contact
-
-    Default weights calibrated to reproduce decoy discrimination
-    on Rosetta decoy sets.
-    """
+    """Physics-based composite scoring function with gradient support."""
 
     DEFAULT_WEIGHTS = {
         "dfire": 1.0,
@@ -651,10 +585,48 @@ class CoarseGrainedForceField:
         phi: Optional[np.ndarray] = None,
         psi: Optional[np.ndarray] = None,
         backbone: Optional[np.ndarray] = None,
-    ) -> float:
-        """Compute total energy."""
-        terms = self.score_decomposed(ca_coords, sequence, phi, psi, backbone)
-        return terms["total"]
+        return_grad: bool = False,
+    ) -> Union[float, Tuple[float, np.ndarray]]:
+        """Compute total energy, optionally with analytical gradient."""
+        n = len(ca_coords)
+        total_e = 0.0
+        total_grad = np.zeros_like(ca_coords)
+
+        # 1. DFIRE (Grad)
+        val, g = dfire2_potential(ca_coords, sequence)
+        total_e += self.weights["dfire"] * val
+        total_grad += self.weights["dfire"] * g
+
+        # 2. LJ (Grad)
+        val, g = lennard_jones_energy(ca_coords, sequence)
+        total_e += self.weights["lj"] * val
+        total_grad += self.weights["lj"] * g
+
+        # 3. Electrostatics (Grad)
+        val, g = electrostatic_energy(ca_coords, sequence)
+        total_e += self.weights["elec"] * val
+        total_grad += self.weights["elec"] * g
+
+        # 4. Rg (Grad)
+        val, g = rg_energy(ca_coords, n)
+        total_e += self.weights["rg"] * val
+        total_grad += self.weights["rg"] * g
+
+        # 5. Solvation (No Grad)
+        total_e += self.weights["solv"] * solvation_energy(ca_coords, sequence)
+
+        # 6. Hydrogen Bonds (No Grad, requires full backbone)
+        if backbone is not None:
+            total_e += self.weights["hbond"] * hbond_energy_dssp(backbone)
+            total_e += self.weights["cb_contact"] * cb_contact_energy(backbone, sequence)
+
+        # 7. Torsion (No Grad, requires phi/psi)
+        if phi is not None and psi is not None:
+            total_e += self.weights["torsion"] * torsional_energy(phi, psi, sequence)
+
+        if return_grad:
+            return total_e, total_grad
+        return total_e
 
     def score_decomposed(
         self,
@@ -668,10 +640,10 @@ class CoarseGrainedForceField:
         n = len(ca_coords)
         terms: Dict[str, float] = {}
 
-        terms["dfire"] = dfire2_potential(ca_coords, sequence)
-        terms["lj"] = lennard_jones_energy(ca_coords, sequence)
-        terms["elec"] = electrostatic_energy(ca_coords, sequence)
-        terms["rg"] = rg_energy(ca_coords, n)
+        terms["dfire"], _ = dfire2_potential(ca_coords, sequence)
+        terms["lj"], _ = lennard_jones_energy(ca_coords, sequence)
+        terms["elec"], _ = electrostatic_energy(ca_coords, sequence)
+        terms["rg"], _ = rg_energy(ca_coords, n)
         terms["solv"] = solvation_energy(ca_coords, sequence)
 
         if backbone is not None:
@@ -689,3 +661,26 @@ class CoarseGrainedForceField:
         terms["total"] = sum(self.weights.get(k, 0) * v for k, v in terms.items()
                              if k != "total")
         return terms
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Legacy API wrappers for backward compatibility
+# ═══════════════════════════════════════════════════════════════════════════
+
+def clash_energy(ca_coords, sequence="", clash_distance=3.2):
+    """Legacy clash energy."""
+    n = len(ca_coords)
+    energy = 0.0
+    for i in range(n):
+        for j in range(i + 2, n):
+            d = np.linalg.norm(ca_coords[i] - ca_coords[j])
+            if d < clash_distance:
+                energy += ((clash_distance - d) / clash_distance) ** 2
+    return energy
+
+def contact_energy(ca_coords, sequence, cutoff=10.0, min_seq_sep=3):
+    res = dfire2_potential(ca_coords, sequence, cutoff, min_seq_sep)
+    return res[0] if isinstance(res, tuple) else res
+
+def ramachandran_score(phi, psi, sequence=""):
+    return torsional_energy(phi, psi, sequence)
