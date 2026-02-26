@@ -264,6 +264,10 @@ class HybridPipeline:
         refined_coords = res.x.reshape((n, 3))
         best_e = res.fun
 
+        if not res.success and res.nit == 0:
+            print(f"  Warning: L-BFGS-B refinement failed to start: {res.message}")
+            return ca_coords
+
         print(f"  Refined (L-BFGS-B): {current_e:.3f} -> {best_e:.3f} ({res.nit} iters)")
         return refined_coords
 
@@ -349,15 +353,8 @@ class HybridPipeline:
 
             backbone = build_backbone(phi_full, psi_full)
             ca_rebuilt = backbone[1::3]
-            _, aligned_backbone = kabsch_rmsd(ca_rebuilt, refined_coords)
-            # This is tricky because kabsch only rotates/translates.
-            # We want the full backbone to match the refined Ca positions.
-            # For now, we'll just use the aligned backbone.
-            results["predicted_backbone"] = aligned_backbone
-            # Wait, kabsch_rmsd on (N,3) vs (N,3) gives aligned (N,3).
-            # We need to apply the rotation to the whole (3N, 3) backbone.
 
-            # Correct Kabsch application to full backbone
+            # Align full (3N, 3) backbone to refined Cα positions using Kabsch
             centroid_rebuilt = np.mean(ca_rebuilt, axis=0)
             centroid_refined = np.mean(refined_coords, axis=0)
             p = ca_rebuilt - centroid_rebuilt
