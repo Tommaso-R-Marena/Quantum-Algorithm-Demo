@@ -22,17 +22,19 @@ We welcome ideas for new features or improvements to existing ones! When suggest
 ### Pull Requests
 1.  **Fork the repo** and create your branch from `main`.
 2.  **Ensure the code follows our style**: We use standard Python conventions (PEP 8).
-3.  **Add tests**: If you add new functionality, please add corresponding unit tests in `Test/tests/`.
+3.  **Add tests**: If you add new functionality, please add corresponding unit tests in `tests/`.
 4.  **Verify your changes**: Run the full test suite before submitting.
     ```bash
-    PYTHONPATH=./Test python -m pytest Test/tests/
+    PYTHONPATH=./src python -m pytest tests/
     ```
 5.  **Documentation**: Update `README.md` or `ABOUT.md` if your changes alter the user-facing API or scientific logic.
 
 ## Project Structure
-*   `Test/quantum_fold/core/`: Physics and biology logic.
-*   `Test/quantum_fold/algorithms/`: Quantum and hybrid optimization algorithms.
-*   `Test/quantum_fold/utils/`: I/O, metrics, and visualization.
+*   `src/quantum_fold/core/`: Physics and biology logic.
+*   `src/quantum_fold/algorithms/`: Quantum and hybrid optimization algorithms.
+*   `src/quantum_fold/utils/`: I/O, metrics, and visualization.
+*   `tests/`: Unit test suite.
+*   `notebooks/`: Demo and tutorial notebooks.
 
 ## Contact
 For any questions, please reach out via GitHub issues or join our research community discussions.

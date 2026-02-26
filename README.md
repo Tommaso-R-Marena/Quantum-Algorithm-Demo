@@ -3,6 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![CI: Pytest](https://github.com/user/Quantum-Algorithm-Demo/actions/workflows/pytest.yml/badge.svg)](https://github.com/user/Quantum-Algorithm-Demo/actions)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/user/Quantum-Algorithm-Demo/blob/main/notebooks/quantum_protein_folding_demo.ipynb)
 
 A research-grade framework for **real-world protein structure prediction** using a hybrid quantum-classical pipeline. This project implements **Quantum Fragment Assembly (QFA)**, a novel approach that combines variational quantum algorithms with classical optimization to solve the combinatorial challenge of protein folding.
 
@@ -18,7 +19,11 @@ The Quantum Protein Folding Framework (QPF) bridges the gap between theoretical 
 
 ## 🚀 Quick Start
 
-### Installation
+### Interactive Demo
+Experience the framework immediately without local setup:
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/user/Quantum-Algorithm-Demo/blob/main/notebooks/quantum_protein_folding_demo.ipynb)
+
+### Local Installation
 
 ```bash
 # Clone the repository
@@ -34,22 +39,25 @@ pip install numpy scipy matplotlib pennylane plotly pytest
 Predict the structure of Chignolin using Simulated Annealing (classical baseline):
 
 ```bash
-PYTHONPATH=./Test python -m quantum_fold.main --mode real --benchmark chignolin --method sa
+PYTHONPATH=./src python -m quantum_fold.main --mode real --benchmark chignolin --method sa
 ```
 
 Run a Quantum Variational Eigensolver (VQE) experiment:
 
 ```bash
-PYTHONPATH=./Test python -m quantum_fold.main --mode real --seq YYDPETGTWY --method vqe --shots 300
+PYTHONPATH=./src python -m quantum_fold.main --mode real --seq YYDPETGTWY --method vqe --shots 300
 ```
 
 ## 🏗 Architecture
 
-The framework is organized into three core pillars:
+The framework is organized for scalability and clarity:
 
-*   **`core/`**: Physical models, including the 8-term force field, NeRF coordinate generation, and fragment library logic.
-*   **`algorithms/`**: The hybrid pipeline, implementing Quantum Fragment Assembly (VQE/QAOA), diffusion priors, and L-BFGS-B refinement.
-*   **`utils/`**: Bioinformatics utilities for PDB I/O, TM-score/RMSD metrics, and publication-quality 3D visualizations.
+*   **`src/`**: The core package logic.
+    *   **`core/`**: Physical models, including the 8-term force field, NeRF coordinate generation, and fragment library logic.
+    *   **`algorithms/`**: The hybrid pipeline, implementing Quantum Fragment Assembly (VQE/QAOA), diffusion priors, and L-BFGS-B refinement.
+    *   **`utils/`**: Bioinformatics utilities for PDB I/O, TM-score/RMSD metrics, and publication-quality 3D visualizations.
+*   **`tests/`**: Rigorous unit test suite.
+*   **`notebooks/`**: Interactive examples and tutorials.
 
 ## 📊 Visualizations
 
@@ -61,10 +69,8 @@ QPF generates high-resolution 3D visualizations and interactive HTML reports. Pr
 
 ## 🧪 Testing
 
-We maintain a rigorous test suite with 70+ unit tests covering everything from coordinate geometry to QUBO encoding.
-
 ```bash
-PYTHONPATH=./Test python -m pytest Test/tests/
+PYTHONPATH=./src python -m pytest tests/
 ```
 
 ## 📜 License
