@@ -1,0 +1,29 @@
+{
+  "Exact": {
+    "energy": -2.0,
+    "time": 0.03982114791870117,
+    "success_rate": 1.0
+  },
+  "Greedy": {
+    "energy": -2.0,
+    "time": 0.23416829109191895
+  },
+  "SA": {
+    "energy": -2.0,
+    "time": 4.418020486831665
+  },
+  "GA": {
+    "energy": -2.0,
+    "time": 3.0092251300811768
+  },
+  "REMC": {
+    "energy": -2.0,
+    "time": 49.08724069595337
+  },
+  "_metadata": {
+    "sequence": "HHPPHH",
+    "n_beads": 6,
+    "model": "HP",
+    "exact_energy": -2.0
+  }
+}
