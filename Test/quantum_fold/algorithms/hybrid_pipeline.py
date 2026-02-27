@@ -340,16 +340,32 @@ class HybridPipeline:
             # Extract dihedrals from refined Calpha trace as a fallback/improvement
             # (Note: extract_dihedrals needs full backbone, so we can't use it on Ca)
             # Instead, we rebuild backbone from fragment dihedrals and then align to refined Ca.
+
+            # Improved assembly of dihedrals from fragments using circular averaging for continuity
             phi_full = np.zeros(self.n_residues)
             psi_full = np.zeros(self.n_residues)
-            # Simplified assembly of dihedrals from fragments
+            phi_sums_sin = np.zeros(self.n_residues)
+            phi_sums_cos = np.zeros(self.n_residues)
+            psi_sums_sin = np.zeros(self.n_residues)
+            psi_sums_cos = np.zeros(self.n_residues)
+            counts = np.zeros(self.n_residues)
+
             for i, choice in enumerate(choices):
-                start_idx = i * (self.fragment_size - self.overlap)
-                conf = library.fragments[i].conformations[choice]
-                for j in range(self.fragment_size):
-                    if start_idx + j < self.n_residues:
-                        phi_full[start_idx + j] = conf.phi[j]
-                        psi_full[start_idx + j] = conf.psi[j]
+                frag = library.fragments[i]
+                conf = frag.conformations[choice]
+                for j in range(frag.length):
+                    idx = frag.start_idx + j
+                    if idx < self.n_residues:
+                        phi_sums_sin[idx] += np.sin(conf.phi[j])
+                        phi_sums_cos[idx] += np.cos(conf.phi[j])
+                        psi_sums_sin[idx] += np.sin(conf.psi[j])
+                        psi_sums_cos[idx] += np.cos(conf.psi[j])
+                        counts[idx] += 1
+
+            for idx in range(self.n_residues):
+                if counts[idx] > 0:
+                    phi_full[idx] = np.arctan2(phi_sums_sin[idx], phi_sums_cos[idx])
+                    psi_full[idx] = np.arctan2(psi_sums_sin[idx], psi_sums_cos[idx])
 
             backbone = build_backbone(phi_full, psi_full)
             ca_rebuilt = backbone[1::3]
