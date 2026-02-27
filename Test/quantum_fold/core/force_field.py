@@ -96,7 +96,19 @@ _MJ_REF = float(np.mean(_MJ_MATRIX))
 
 
 def mj_contact_energy(aa_i: str, aa_j: str) -> float:
-    """Get Miyazawa-Jernigan contact energy between two residues."""
+    """
+    Get Miyazawa-Jernigan contact energy between two residues.
+
+    Parameters
+    ----------
+    aa_i, aa_j : str
+        One-letter amino acid codes.
+
+    Returns
+    -------
+    energy : float
+        Statistical contact energy in kcal/mol-equivalent.
+    """
     i = _AA_IDX.get(aa_i, 0)
     j = _AA_IDX.get(aa_j, 0)
     return float(_MJ_MATRIX[i, j] - _MJ_REF)
@@ -179,43 +191,69 @@ def dfire2_potential(
     sequence: str,
     cutoff: float = 15.0,
     min_seq_sep: int = 3,
-) -> Union[float, Tuple[float, np.ndarray]]:
+) -> Tuple[float, np.ndarray]:
     """
     DFIRE2-type distance-dependent contact potential.
-    Now with analytical gradient support.
+    Vectorized NumPy implementation.
+
+    Parameters
+    ----------
+    ca_coords : np.ndarray, shape (N, 3)
+        Cα coordinates in Å.
+    sequence : str
+        Amino acid sequence.
+    cutoff : float
+        Distance cutoff in Å.
+    min_seq_sep : int
+        Minimum sequence separation for interacting pairs.
+
+    Returns
+    -------
+    energy : float
+        Total DFIRE2 energy.
+    gradient : np.ndarray, shape (N, 3)
+        Analytical gradient w.r.t. ca_coords.
     """
     n = len(ca_coords)
-    energy = 0.0
+    if n < min_seq_sep:
+        return 0.0, np.zeros_like(ca_coords)
+
+    # Pairwise vectors and distances
+    R = ca_coords[:, np.newaxis, :] - ca_coords[np.newaxis, :, :]
+    D = np.linalg.norm(R, axis=2)
+
+    # Validate input lengths
+    if len(sequence) != n:
+        # Fallback to Alanine if sequence is shorter, or truncate if longer
+        if len(sequence) < n:
+            sequence = (sequence + "A" * n)[:n]
+        else:
+            sequence = sequence[:n]
+
+    # Mask for interacting pairs
+    mask = (np.triu(np.ones((n, n), dtype=bool), k=min_seq_sep)) & (D < cutoff) & (D >= 1.0)
+
+    # Pre-calculate epsilon matrix
+    indices = [_AA_IDX.get(aa, 0) for aa in sequence]
+    eps_matrix = _MJ_MATRIX[np.ix_(indices, indices)] - _MJ_REF
+
     alpha = 1.61
+    # Distances for masked pairs
+    d_masked = D[mask]
+    ratio = cutoff / (d_masked + 1e-12)
+    g = ratio ** alpha - 1.0
+    energy = np.sum(eps_matrix[mask] * g)
+
+    # Gradient calculation
+    de_dd = -eps_matrix[mask] * alpha * (cutoff ** alpha) / (d_masked ** (alpha + 1) + 1e-12)
+    d_grad = (de_dd / (d_masked + 1e-12))[:, np.newaxis] * R[mask]
+
     grad = np.zeros_like(ca_coords)
+    i_indices, j_indices = np.where(mask)
+    np.add.at(grad, i_indices, d_grad)
+    np.add.at(grad, j_indices, -d_grad)
 
-    for i in range(n):
-        for j in range(i + min_seq_sep, n):
-            vec = ca_coords[i] - ca_coords[j]
-            d = np.linalg.norm(vec)
-            if d > cutoff or d < 1.0:
-                continue
-
-            # e(d) = eps * ((cutoff/d)^alpha - 1)
-            aa_i = sequence[i] if i < len(sequence) else "A"
-            aa_j = sequence[j] if j < len(sequence) else "A"
-            eps = mj_contact_energy(aa_i, aa_j)
-
-            ratio = cutoff / d
-            g = ratio ** alpha - 1.0
-            energy += eps * g
-
-            # de/dd = eps * alpha * (cutoff/d)^(alpha-1) * (-cutoff/d^2)
-            #       = -eps * alpha * cutoff^alpha / d^(alpha+1)
-            de_dd = -eps * alpha * (cutoff ** alpha) / (d ** (alpha + 1))
-
-            # de/dri = de/dd * (ri - rj) / d
-            d_inv = 1.0 / (d + 1e-12)
-            d_grad = de_dd * vec * d_inv
-            grad[i] += d_grad
-            grad[j] -= d_grad
-
-    return (energy, grad)
+    return energy, grad
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -351,44 +389,63 @@ def lennard_jones_energy(
     sequence: str,
     min_seq_sep: int = 2,
     cutoff: float = 12.0,
-) -> Union[float, Tuple[float, np.ndarray]]:
+) -> Tuple[float, np.ndarray]:
     """
     Soft-Core Lennard-Jones potential with residue-specific σ.
-    Now with analytical gradient support.
+    Vectorized NumPy implementation.
+
+    Parameters
+    ----------
+    ca_coords : np.ndarray, shape (N, 3)
+        Cα coordinates in Å.
+    sequence : str
+        Amino acid sequence.
+    min_seq_sep : int
+        Minimum sequence separation.
+    cutoff : float
+        Distance cutoff in Å.
+
+    Returns
+    -------
+    energy : float
+        Total LJ energy.
+    gradient : np.ndarray, shape (N, 3)
+        Analytical gradient w.r.t. ca_coords.
     """
     n = len(ca_coords)
+    if n < min_seq_sep:
+        return 0.0, np.zeros_like(ca_coords)
+
     eps_val = 0.2
-    alpha = 0.1
-    energy = 0.0
+    alpha_sc = 0.1  # Named alpha_sc to avoid conflict with alpha in DFIRE
+
+    R = ca_coords[:, np.newaxis, :] - ca_coords[np.newaxis, :, :]
+    D = np.linalg.norm(R, axis=2)
+
+    # Validate sequence length
+    if len(sequence) != n:
+        sequence = (sequence + "A" * n)[:n]
+
+    mask = (np.triu(np.ones((n, n), dtype=bool), k=min_seq_sep)) & (D < cutoff)
+
+    # Pre-calculate sigma matrix
+    sigmas = np.array([SIGMA_VDW.get(aa, 3.8) for aa in sequence])
+    sigma_matrix = (sigmas[:, np.newaxis] + sigmas[np.newaxis, :]) / 2.0
+
+    d_masked = D[mask]
+    u = (d_masked / sigma_matrix[mask]) ** 6
+    denom = alpha_sc + u
+    energy = np.sum(4.0 * eps_val * (1.0 / (denom ** 2) - 1.0 / denom))
+
+    de_dd = (24.0 * eps_val * u / (d_masked * (denom ** 2) + 1e-12)) * (1.0 - 2.0 / denom)
+    d_grad = (de_dd / (d_masked + 1e-12))[:, np.newaxis] * R[mask]
+
     grad = np.zeros_like(ca_coords)
+    i_indices, j_indices = np.where(mask)
+    np.add.at(grad, i_indices, d_grad)
+    np.add.at(grad, j_indices, -d_grad)
 
-    for i in range(n):
-        for j in range(i + min_seq_sep, n):
-            vec = ca_coords[i] - ca_coords[j]
-            d = np.linalg.norm(vec)
-            if d > cutoff:
-                continue
-
-            aa_i = sequence[i] if i < len(sequence) else "A"
-            aa_j = sequence[j] if j < len(sequence) else "A"
-            sigma = (SIGMA_VDW.get(aa_i, 3.8) + SIGMA_VDW.get(aa_j, 3.8)) / 2.0
-
-            # Soft-core formulation
-            u = (d / sigma) ** 6
-            denom = alpha + u
-
-            # energy = 4.0 * eps * (1.0 / (denom ** 2) - 1.0 / denom)
-            energy += 4.0 * eps_val * (1.0 / (denom ** 2) - 1.0 / denom)
-
-            # dv/dd = (24*eps*u / (d * denom^2)) * (1 - 2/denom)
-            d_inv = 1.0 / (d + 1e-12)
-            dv_dd = (24.0 * eps_val * u / (d * (denom ** 2) + 1e-12)) * (1.0 - 2.0 / denom)
-
-            d_grad = dv_dd * vec * d_inv
-            grad[i] += d_grad
-            grad[j] -= d_grad
-
-    return (energy, grad)
+    return energy, grad
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -401,48 +458,71 @@ def electrostatic_energy(
     ionic_strength: float = 0.15,
     temperature: float = 300.0,
     min_seq_sep: int = 3,
-) -> Union[float, Tuple[float, np.ndarray]]:
+) -> Tuple[float, np.ndarray]:
     """
     Screened Coulomb (Debye-Hückel) electrostatics.
-    Now with analytical gradient support.
+    Vectorized NumPy implementation.
+
+    Parameters
+    ----------
+    ca_coords : np.ndarray, shape (N, 3)
+        Cα coordinates in Å.
+    sequence : str
+        Amino acid sequence.
+    ionic_strength : float
+        Molar concentration (M).
+    temperature : float
+        Temperature in Kelvin.
+    min_seq_sep : int
+        Minimum sequence separation.
+
+    Returns
+    -------
+    energy : float
+        Total electrostatic energy.
+    gradient : np.ndarray, shape (N, 3)
+        Analytical gradient w.r.t. ca_coords.
     """
     n = len(ca_coords)
+    if n < min_seq_sep:
+        return 0.0, np.zeros_like(ca_coords)
+
     eps_r = 80.0
-    kB_T = 0.001987 * temperature  # kcal/mol
+    kB_T = 0.001987 * temperature
     debye_length = np.sqrt(eps_r * kB_T / (8 * np.pi * 0.000602 * ionic_strength))
     debye_length = max(debye_length, 3.0)
 
-    energy = 0.0
+    R = ca_coords[:, np.newaxis, :] - ca_coords[np.newaxis, :, :]
+    D = np.linalg.norm(R, axis=2)
+
+    # Validate sequence length
+    if len(sequence) != n:
+        sequence = (sequence + "A" * n)[:n]
+
+    mask = (np.triu(np.ones((n, n), dtype=bool), k=min_seq_sep)) & (D >= 1.0) & (D <= 30.0)
+
+    q = np.array([FORMAL_CHARGE.get(aa, 0.0) for aa in sequence])
+    q_matrix = q[:, np.newaxis] * q[np.newaxis, :]
+    mask = mask & (np.abs(q_matrix) > 1e-4)
+
+    if not np.any(mask):
+        return 0.0, np.zeros_like(ca_coords)
+
+    d_masked = D[mask]
+    pref = 332.0 * q_matrix[mask] / eps_r
+    exp_term = np.exp(-d_masked / debye_length)
+    val = (pref / (d_masked + 1e-12)) * exp_term
+    energy = np.sum(val)
+
+    dv_dd = -val * (1.0 / (d_masked + 1e-12) + 1.0 / debye_length)
+    d_grad = (dv_dd / (d_masked + 1e-12))[:, np.newaxis] * R[mask]
+
     grad = np.zeros_like(ca_coords)
+    i_indices, j_indices = np.where(mask)
+    np.add.at(grad, i_indices, d_grad)
+    np.add.at(grad, j_indices, -d_grad)
 
-    for i in range(n):
-        qi = FORMAL_CHARGE.get(sequence[i] if i < len(sequence) else "A", 0.0)
-        if abs(qi) < 0.01:
-            continue
-        for j in range(i + min_seq_sep, n):
-            qj = FORMAL_CHARGE.get(sequence[j] if j < len(sequence) else "A", 0.0)
-            if abs(qj) < 0.01:
-                continue
-
-            vec = ca_coords[i] - ca_coords[j]
-            d = np.linalg.norm(vec)
-            if d < 1.0 or d > 30.0:
-                continue
-
-            pref = 332.0 * qi * qj / eps_r
-            exp_term = np.exp(-d / debye_length)
-            val = (pref / d) * exp_term
-            energy += val
-
-            # dv/dd = -val/d - val/debye_length = -val * (1/d + 1/L)
-            d_inv = 1.0 / (d + 1e-12)
-            dv_dd = -val * (d_inv + 1.0 / debye_length)
-
-            d_grad = dv_dd * vec * d_inv
-            grad[i] += d_grad
-            grad[j] -= d_grad
-
-    return (energy, grad)
+    return energy, grad
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -496,30 +576,68 @@ def solvation_energy(
     ca_coords: np.ndarray,
     sequence: str,
     burial_cutoff: float = 9.0,
-) -> float:
+    k_smooth: float = 2.0,
+) -> Tuple[float, np.ndarray]:
     """
-    EEF1-inspired implicit solvation.
-    (Non-differentiable step function used for burial count)
+    Smooth EEF1-inspired implicit solvation with analytical gradient.
+    Uses a sigmoid function for differentiable burial count.
+
+    Parameters
+    ----------
+    ca_coords : np.ndarray, shape (N, 3)
+        Cα coordinates in Å.
+    sequence : str
+        Amino acid sequence.
+    burial_cutoff : float
+        Distance threshold for burial in Å.
+    k_smooth : float
+        Steepness of the sigmoid function.
+
+    Returns
+    -------
+    energy : float
+        Total solvation energy.
+    gradient : np.ndarray, shape (N, 3)
+        Analytical gradient w.r.t. ca_coords.
     """
     n = len(ca_coords)
     rho_max = 16.0
-    energy = 0.0
 
-    for i in range(n):
-        rho = 0.0
-        for j in range(n):
-            if abs(i - j) < 2:
-                continue
-            d = np.linalg.norm(ca_coords[i] - ca_coords[j])
-            if d < burial_cutoff:
-                rho += 1.0
+    # R[i, j] is vector ri - rj
+    R = ca_coords[:, np.newaxis, :] - ca_coords[np.newaxis, :, :]
+    D = np.linalg.norm(R, axis=2)
 
-        f_surface = max(0.0, 1.0 - rho / rho_max)
-        aa = sequence[i] if i < len(sequence) else "A"
-        dg = SOLVATION_DG.get(aa, 0.0)
-        energy += dg * f_surface
+    # Validate sequence length
+    if len(sequence) != n:
+        sequence = (sequence + "A" * n)[:n]
 
-    return energy
+    # Distance mask for sequence separation >= 2
+    seq_sep_mask = np.abs(np.arange(n)[:, np.newaxis] - np.arange(n)[np.newaxis, :]) >= 2
+
+    # Sigmoid function for smooth burial count: S(d) = 1 / (1 + exp(k * (d - d0)))
+    sigmoid = 1.0 / (1.0 + np.exp(k_smooth * (D - burial_cutoff)))
+    rho = np.sum(sigmoid * seq_sep_mask, axis=1)
+
+    # Smooth ReLU for surface fraction: f_surface = max(0, 1 - rho/rho_max)
+    diff = 1.0 - rho / rho_max
+    eps_smooth = 1e-4
+    f_surface = 0.5 * (diff + np.sqrt(diff**2 + eps_smooth))
+
+    dg = np.array([SOLVATION_DG.get(aa, 0.0) for aa in sequence])
+    energy = np.sum(dg * f_surface)
+
+    # df_surface_i / drho_i
+    df_drho = -1.0 / rho_max * 0.5 * (1.0 + diff / np.sqrt(diff**2 + eps_smooth))
+    # dS(d_ij) / d_ij
+    dS_dd = -k_smooth * sigmoid * (1.0 - sigmoid)
+
+    # Symmetric kernel for gradient
+    kernel = (dg[:, np.newaxis] * df_drho[:, np.newaxis] + dg[np.newaxis, :] * df_drho[np.newaxis, :]) * \
+             dS_dd * seq_sep_mask / (D + 1e-12)
+
+    grad = np.sum(kernel[:, :, np.newaxis] * R, axis=1)
+
+    return energy, grad
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -587,7 +705,29 @@ class CoarseGrainedForceField:
         backbone: Optional[np.ndarray] = None,
         return_grad: bool = False,
     ) -> Union[float, Tuple[float, np.ndarray]]:
-        """Compute total energy, optionally with analytical gradient."""
+        """
+        Compute total energy, optionally with analytical gradient.
+
+        Parameters
+        ----------
+        ca_coords : np.ndarray, shape (N, 3)
+            Cα coordinates.
+        sequence : str
+            Protein sequence.
+        phi, psi : np.ndarray, optional
+            Dihedral angles for torsional energy.
+        backbone : np.ndarray, optional
+            Full backbone coordinates for H-bonds and CB contacts.
+        return_grad : bool
+            Whether to return the analytical gradient.
+
+        Returns
+        -------
+        score : float
+            Total weighted energy.
+        gradient : np.ndarray, optional
+            Total gradient (if return_grad=True).
+        """
         n = len(ca_coords)
         total_e = 0.0
         total_grad = np.zeros_like(ca_coords)
@@ -612,8 +752,10 @@ class CoarseGrainedForceField:
         total_e += self.weights["rg"] * val
         total_grad += self.weights["rg"] * g
 
-        # 5. Solvation (No Grad)
-        total_e += self.weights["solv"] * solvation_energy(ca_coords, sequence)
+        # 5. Solvation (Grad)
+        val, g = solvation_energy(ca_coords, sequence)
+        total_e += self.weights["solv"] * val
+        total_grad += self.weights["solv"] * g
 
         # 6. Hydrogen Bonds (No Grad, requires full backbone)
         if backbone is not None:
@@ -644,7 +786,7 @@ class CoarseGrainedForceField:
         terms["lj"], _ = lennard_jones_energy(ca_coords, sequence)
         terms["elec"], _ = electrostatic_energy(ca_coords, sequence)
         terms["rg"], _ = rg_energy(ca_coords, n)
-        terms["solv"] = solvation_energy(ca_coords, sequence)
+        terms["solv"], _ = solvation_energy(ca_coords, sequence)
 
         if backbone is not None:
             terms["hbond"] = hbond_energy_dssp(backbone)
