@@ -254,6 +254,7 @@ class FragmentLibrary:
     ) -> Dict:
         """
         Build the energy matrices for the QUBO formulation.
+        Optimized to pre-calculate conformation-specific energies.
 
         Returns
         -------
@@ -268,11 +269,22 @@ class FragmentLibrary:
 
         n_frags = len(self.fragments)
 
-        # Internal energies
+        # Pre-calculate internal and individual fragment force field energies
+        # to avoid redundant calculations in the pairwise loops.
         internal = []
+        fragment_ff_energies = []
         for frag in self.fragments:
-            energies = np.array([c.internal_energy for c in frag.conformations])
-            internal.append(energies)
+            internal_e = np.array([c.internal_energy for c in frag.conformations])
+            internal.append(internal_e)
+
+            # Pre-calculate non-bonded FF energy for each conformation
+            ff_e = []
+            for conf in frag.conformations:
+                terms = force_field.score_decomposed(conf.ca_coords, frag.sequence)
+                # DFIRE, LJ, Electrostatics, and Solvation
+                e = terms["dfire"] + terms["lj"] + terms["elec"] + terms["solv"]
+                ff_e.append(e)
+            fragment_ff_energies.append(np.array(ff_e))
 
         # Pairwise interaction energies between adjacent fragments
         pairwise = {}
@@ -286,10 +298,16 @@ class FragmentLibrary:
 
             E_pair = np.zeros((m_i, m_j), dtype=np.float64)
 
+            e_i_all = fragment_ff_energies[fi]
+            e_j_all = fragment_ff_energies[fj]
+
             for ci in range(m_i):
                 for cj in range(m_j):
                     # Evaluate overlap consistency + true force field energy
-                    e = self._pairwise_energy(frag_i, ci, frag_j, cj, force_field)
+                    e = self._pairwise_energy(
+                        frag_i, ci, frag_j, cj, force_field,
+                        e_i=e_i_all[ci], e_j=e_j_all[cj]
+                    )
                     E_pair[ci, cj] = e
 
             pairwise[(fi, fj)] = E_pair
@@ -306,6 +324,8 @@ class FragmentLibrary:
         frag_i: Fragment, ci: int,
         frag_j: Fragment, cj: int,
         force_field: CoarseGrainedForceField,
+        e_i: Optional[float] = None,
+        e_j: Optional[float] = None,
     ) -> float:
         """
         Compute pairwise energy between two fragment conformations.
@@ -364,22 +384,21 @@ class FragmentLibrary:
             combined_seq += frag_j.sequence
 
         combined_ca = np.array(combined_ca)
-        
+
         # Evaluate true force field energy (only non-bonded terms matter for inter-fragment)
-        # We temporarily disable terms that require full backbone or phi/psi to save time,
-        # relying on DFIRE, LJ, Electrostatics, and Solvation for pairwise Cα interactions.
         ff_terms = force_field.score_decomposed(combined_ca, combined_seq)
-        
-        # We only want the interaction energy, not the internal energy of each fragment again.
-        # But for QUBO formulation, E_pair = E(ij) - E(i) - E(j)
+
+        # E_pair = E(ij) - E(i) - E(j)
         e_ij = ff_terms["dfire"] + ff_terms["lj"] + ff_terms["elec"] + ff_terms["solv"]
-        
-        e_i_terms = force_field.score_decomposed(conf_i.ca_coords, frag_i.sequence)
-        e_i = e_i_terms["dfire"] + e_i_terms["lj"] + e_i_terms["elec"] + e_i_terms["solv"]
-        
-        e_j_terms = force_field.score_decomposed(conf_j.ca_coords, frag_j.sequence)
-        e_j = e_j_terms["dfire"] + e_j_terms["lj"] + e_j_terms["elec"] + e_j_terms["solv"]
-        
+
+        if e_i is None:
+            e_i_terms = force_field.score_decomposed(conf_i.ca_coords, frag_i.sequence)
+            e_i = e_i_terms["dfire"] + e_i_terms["lj"] + e_i_terms["elec"] + e_i_terms["solv"]
+
+        if e_j is None:
+            e_j_terms = force_field.score_decomposed(conf_j.ca_coords, frag_j.sequence)
+            e_j = e_j_terms["dfire"] + e_j_terms["lj"] + e_j_terms["elec"] + e_j_terms["solv"]
+
         inter_energy = e_ij - e_i - e_j
         energy += inter_energy
 
