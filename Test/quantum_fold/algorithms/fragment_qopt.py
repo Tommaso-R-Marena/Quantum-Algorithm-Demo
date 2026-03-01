@@ -37,13 +37,21 @@ from ..core.backbone import kabsch_rmsd
 
 class FragmentQUBO:
     """
-    Build and solve the QUBO for fragment assembly.
+    Formulates the protein fragment assembly problem as a Quadratic
+    Unconstrained Binary Optimization (QUBO) task.
+
+    The cost function is defined as:
+        H = Σ_k H_internal(k, x_k) + Σ_{k,l} H_pairwise(k, x_k, l, x_l)
+    where x_k is the binary-encoded index of the conformation for fragment k.
+    Each conformation index x_k is mapped to a set of qubits using a
+    resource-efficient integer encoding.
 
     Parameters
     ----------
     library : FragmentLibrary
-        Fragment library with conformations.
+        Fragment library containing discrete conformations.
     force_field : CoarseGrainedForceField, optional
+        Force field used to evaluate interaction energies.
     """
 
     def __init__(

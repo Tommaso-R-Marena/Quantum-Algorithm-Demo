@@ -254,27 +254,31 @@ class FragmentLibrary:
     ) -> Dict:
         """
         Build the energy matrices for the QUBO formulation.
-
-        Returns
-        -------
-        dict with:
-          "internal" : list of arrays — internal energy per conformation per fragment
-          "pairwise" : dict (i,j) → matrix of pairwise interaction energies
-          "n_fragments" : int
-          "conformations_per_fragment" : list of int
+        Optimized to avoid redundant force field evaluations.
         """
         if force_field is None:
             force_field = CoarseGrainedForceField()
 
         n_frags = len(self.fragments)
 
-        # Internal energies
+        # 1. Internal energies (Ramachandran + local clashes)
         internal = []
         for frag in self.fragments:
             energies = np.array([c.internal_energy for c in frag.conformations])
             internal.append(energies)
 
-        # Pairwise interaction energies between adjacent fragments
+        # 2. Pre-calculate non-bonded internal energies for each conformation
+        # (dfire, lj, elec, solv) to avoid redundant calculation in pairwise loop.
+        internal_nb = []
+        for frag in self.fragments:
+            nb_energies = []
+            for conf in frag.conformations:
+                terms = force_field.score_decomposed(conf.ca_coords, frag.sequence)
+                e_nb = terms["dfire"] + terms["lj"] + terms["elec"] + terms["solv"]
+                nb_energies.append(e_nb)
+            internal_nb.append(np.array(nb_energies))
+
+        # 3. Pairwise interaction energies between adjacent fragments
         pairwise = {}
         for fi in range(n_frags - 1):
             fj = fi + 1
@@ -286,10 +290,34 @@ class FragmentLibrary:
 
             E_pair = np.zeros((m_i, m_j), dtype=np.float64)
 
+            # Pre-calculate shared info for the fragment pair
+            overlap_start = frag_j.start_idx
+            overlap_end = frag_i.end_idx
+            n_overlap = max(0, overlap_end - overlap_start)
+
+            # Subsequences for combined trace
+            if n_overlap > 0:
+                seq_i_only = frag_i.sequence[:-n_overlap]
+                seq_overlap = frag_i.sequence[-n_overlap:]
+                seq_j_only = frag_j.sequence[n_overlap:]
+                combined_seq = seq_i_only + seq_overlap + seq_j_only
+            else:
+                combined_seq = frag_i.sequence + frag_j.sequence
+
             for ci in range(m_i):
+                conf_i = frag_i.conformations[ci]
+                e_nb_i = internal_nb[fi][ci]
+
                 for cj in range(m_j):
-                    # Evaluate overlap consistency + true force field energy
-                    e = self._pairwise_energy(frag_i, ci, frag_j, cj, force_field)
+                    conf_j = frag_j.conformations[cj]
+                    e_nb_j = internal_nb[fj][cj]
+
+                    # Evaluate overlap consistency + interaction energy
+                    e = self._pairwise_energy_opt(
+                        conf_i, e_nb_i,
+                        conf_j, e_nb_j,
+                        combined_seq, n_overlap, force_field
+                    )
                     E_pair[ci, cj] = e
 
             pairwise[(fi, fj)] = E_pair
@@ -301,86 +329,36 @@ class FragmentLibrary:
             "conformations_per_fragment": [f.n_conformations for f in self.fragments],
         }
 
-    def _pairwise_energy(
+    def _pairwise_energy_opt(
         self,
-        frag_i: Fragment, ci: int,
-        frag_j: Fragment, cj: int,
+        conf_i: FragmentConformation, e_nb_i: float,
+        conf_j: FragmentConformation, e_nb_j: float,
+        combined_seq: str, n_overlap: int,
         force_field: CoarseGrainedForceField,
     ) -> float:
-        """
-        Compute pairwise energy between two fragment conformations.
-
-        Includes:
-          1. Overlap consistency (RMSD of shared residues)
-          2. Inter-fragment energy evaluated with the true 8-term Force Field
-        """
-        conf_i = frag_i.conformations[ci]
-        conf_j = frag_j.conformations[cj]
-
+        """Optimized pairwise energy calculation."""
         energy = 0.0
 
-        # Check overlap region
-        overlap_start = frag_j.start_idx
-        overlap_end = frag_i.end_idx
-
-        if overlap_start < overlap_end:
-            # There is an overlap
-            n_overlap = overlap_end - overlap_start
-
-            # Get overlapping Cα coords from each fragment
-            ca_i_overlap = conf_i.ca_coords[-(n_overlap):]
+        # 1. Overlap consistency
+        if n_overlap > 0:
+            ca_i_overlap = conf_i.ca_coords[-n_overlap:]
             ca_j_overlap = conf_j.ca_coords[:n_overlap]
+            rmsd, _ = kabsch_rmsd(ca_i_overlap, ca_j_overlap)
+            energy += rmsd ** 2 * 10.0  # quadratic penalty
 
-            if len(ca_i_overlap) > 0 and len(ca_j_overlap) > 0:
-                # RMSD of overlap region (penalise inconsistency)
-                rmsd, _ = kabsch_rmsd(ca_i_overlap, ca_j_overlap)
-                energy += rmsd ** 2 * 10.0  # quadratic penalty
-
-        # Build combined Cα trace for the interacting pair
-        combined_ca = []
-        combined_seq = ""
-
-        if overlap_start < overlap_end:
-            # They overlap. Take i up to overlap, average overlap, then j
-            for k in range(frag_i.length):
-                pos = frag_i.start_idx + k
-                if pos < overlap_start:
-                    combined_ca.append(conf_i.ca_coords[k])
-                    combined_seq += frag_i.sequence[k]
-                elif pos < overlap_end:
-                    idx_j = pos - frag_j.start_idx
-                    avg_ca = (conf_i.ca_coords[k] + conf_j.ca_coords[idx_j]) / 2.0
-                    combined_ca.append(avg_ca)
-                    combined_seq += frag_i.sequence[k]
-
-            for k in range(overlap_end - frag_j.start_idx, frag_j.length):
-                combined_ca.append(conf_j.ca_coords[k])
-                combined_seq += frag_j.sequence[k]
+            # Build combined Cα trace (optimized vectorization)
+            ca_i_only = conf_i.ca_coords[:-n_overlap]
+            ca_overlap = (ca_i_overlap + ca_j_overlap) * 0.5
+            ca_j_only = conf_j.ca_coords[n_overlap:]
+            combined_ca = np.vstack([ca_i_only, ca_overlap, ca_j_only])
         else:
-            # No overlap
-            combined_ca.extend(conf_i.ca_coords)
-            combined_seq += frag_i.sequence
-            combined_ca.extend(conf_j.ca_coords)
-            combined_seq += frag_j.sequence
+            combined_ca = np.vstack([conf_i.ca_coords, conf_j.ca_coords])
 
-        combined_ca = np.array(combined_ca)
-        
-        # Evaluate true force field energy (only non-bonded terms matter for inter-fragment)
-        # We temporarily disable terms that require full backbone or phi/psi to save time,
-        # relying on DFIRE, LJ, Electrostatics, and Solvation for pairwise Cα interactions.
+        # 2. Inter-fragment energy (E_combined - E_i - E_j)
         ff_terms = force_field.score_decomposed(combined_ca, combined_seq)
-        
-        # We only want the interaction energy, not the internal energy of each fragment again.
-        # But for QUBO formulation, E_pair = E(ij) - E(i) - E(j)
         e_ij = ff_terms["dfire"] + ff_terms["lj"] + ff_terms["elec"] + ff_terms["solv"]
-        
-        e_i_terms = force_field.score_decomposed(conf_i.ca_coords, frag_i.sequence)
-        e_i = e_i_terms["dfire"] + e_i_terms["lj"] + e_i_terms["elec"] + e_i_terms["solv"]
-        
-        e_j_terms = force_field.score_decomposed(conf_j.ca_coords, frag_j.sequence)
-        e_j = e_j_terms["dfire"] + e_j_terms["lj"] + e_j_terms["elec"] + e_j_terms["solv"]
-        
-        inter_energy = e_ij - e_i - e_j
+
+        inter_energy = e_ij - e_nb_i - e_nb_j
         energy += inter_energy
 
         return energy
