@@ -141,6 +141,8 @@ class HybridPipeline:
               f"{qubo.n_fragments} fragments")
 
         assembly_result = self._solve_assembly(qubo)
+        self._last_choices = assembly_result.get("best_choices", [])
+        self._last_library = library
 
         # Step 5: Local refinement
         print(f"\n[5/6] Local refinement ({self.n_refine_steps} steps)...")
@@ -240,36 +242,77 @@ class HybridPipeline:
 
     def _refine(self, ca_coords: np.ndarray) -> np.ndarray:
         """
-        Local refinement using L-BFGS-B and analytical gradients.
-        Faster and more accurate than stochastic gradient descent.
+        Two-stage local refinement:
+        1. Coordinate-space refinement (L-BFGS-B on Cα).
+        2. Dihedral-space refinement (L-BFGS-B on φ/ψ).
         """
-        initial_coords = ca_coords.copy().astype(np.float64)
-        n = len(initial_coords)
+        n = len(ca_coords)
 
-        def objective(x):
+        # --- Stage 1: Cα Refinement ---
+        initial_ca = ca_coords.copy().astype(np.float64)
+
+        def obj_ca(x):
             coords = x.reshape((n, 3))
             e, grad = self.ff.score(coords, self.sequence, return_grad=True)
             return e, grad.flatten()
 
-        current_e = self.ff.score(initial_coords, self.sequence)
-
-        res = minimize(
-            objective,
-            initial_coords.flatten(),
-            jac=True,
-            method="L-BFGS-B",
+        res_ca = minimize(
+            obj_ca, initial_ca.flatten(), jac=True, method="L-BFGS-B",
             options={"maxiter": self.n_refine_steps, "ftol": 1e-7}
         )
+        refined_ca = res_ca.x.reshape((n, 3))
 
-        refined_coords = res.x.reshape((n, 3))
-        best_e = res.fun
+        # --- Stage 2: Dihedral Refinement ---
+        # Extract initial dihedrals from fragment choices (if available)
+        # or use default values.
+        phi = np.full(n, -1.22)
+        psi = np.full(n, 2.53)
 
-        if not res.success and res.nit == 0:
-            print(f"  Warning: L-BFGS-B refinement failed to start: {res.message}")
-            return ca_coords
+        # If we have assembly results, use those as starting point
+        if hasattr(self, "_last_choices") and hasattr(self, "_last_library"):
+            choices = self._last_choices
+            library = self._last_library
+            for i, choice in enumerate(choices):
+                frag = library.fragments[i]
+                conf = frag.conformations[choice]
+                for j in range(frag.length):
+                    idx = frag.start_idx + j
+                    if idx < n:
+                        phi[idx] = conf.phi[j]
+                        psi[idx] = conf.psi[j]
 
-        print(f"  Refined (L-BFGS-B): {current_e:.3f} -> {best_e:.3f} ({res.nit} iters)")
-        return refined_coords
+        def obj_dihedral(params):
+            p = params[:n]
+            s = params[n:]
+
+            # Rebuild coordinates
+            current_ca = build_ca_trace(p, s)
+            current_bb = build_backbone(p, s)
+
+            # Full force field score
+            # We use analytical gradients for torsion, but numerical for coordinates-dependence
+            # To keep it simple and robust, we'll let L-BFGS-B use numerical gradients for this stage
+            # or just use the torsion analytical gradient.
+            e = self.ff.score(current_ca, self.sequence, phi=p, psi=s, backbone=current_bb)
+
+            # Optional: Add a restraint to keep CA close to Stage 1 result
+            dist_restraint = 0.5 * np.sum((current_ca - refined_ca)**2)
+            return e + dist_restraint
+
+        init_dihedrals = np.concatenate([phi, psi])
+        res_dihedral = minimize(
+            obj_dihedral, init_dihedrals, method="L-BFGS-B",
+            options={"maxiter": self.n_refine_steps // 2, "ftol": 1e-6}
+        )
+
+        final_phi = res_dihedral.x[:n]
+        final_psi = res_dihedral.x[n:]
+        final_ca = build_ca_trace(final_phi, final_psi)
+
+        print(f"  Refinement: Stage 1 (Cα) E={res_ca.fun:.3f}, "
+              f"Stage 2 (Dihedral) E={res_dihedral.fun:.3f}")
+
+        return final_ca
 
     def _evaluate(
         self,

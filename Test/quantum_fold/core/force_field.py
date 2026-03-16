@@ -317,12 +317,16 @@ def torsional_energy(
     phi: np.ndarray,
     psi: np.ndarray,
     sequence: str = "",
-) -> float:
+    return_grad: bool = False,
+) -> Union[float, Tuple[float, np.ndarray, np.ndarray]]:
     """
     Torsional energy as a Fourier series fit to Ramachandran statistics.
+    Provides analytical gradients for phi and psi.
     """
     n = len(phi)
     energy = 0.0
+    grad_phi = np.zeros_like(phi) if return_grad else None
+    grad_psi = np.zeros_like(psi) if return_grad else None
 
     for k in range(n):
         if k == 0 or k == n - 1:
@@ -340,32 +344,54 @@ def torsional_energy(
         # Fourier coefficients (kcal/mol)
         if is_gly:
             # Glycine: symmetric, broad distribution
-            e = -0.5 * (np.cos(p) + np.cos(q))
-            e += 0.3 * np.cos(2 * p) + 0.3 * np.cos(2 * q)
+            energy += -0.5 * (np.cos(p) + np.cos(q)) + 0.3 * np.cos(2 * p) + 0.3 * np.cos(2 * q)
+            if return_grad:
+                grad_phi[k] = 0.5 * np.sin(p) - 0.6 * np.sin(2 * p)
+                grad_psi[k] = 0.5 * np.sin(q) - 0.6 * np.sin(2 * q)
         elif is_pro:
             # Proline: restricted φ ≈ -63° ± 20°
-            e = 2.0 * (1 - np.cos(p + 1.10))
-            e += -0.5 * np.cos(q) + 0.3 * np.cos(2 * q)
+            energy += 2.0 * (1 - np.cos(p + 1.10)) - 0.5 * np.cos(q) + 0.3 * np.cos(2 * q)
+            if return_grad:
+                grad_phi[k] = 2.0 * np.sin(p + 1.10)
+                grad_psi[k] = 0.5 * np.sin(q) - 0.6 * np.sin(2 * q)
         elif is_prepro:
             # Pre-proline: restricted ψ
-            e = -0.8 * np.cos(p + 1.05) + 0.4 * np.cos(2 * p)
-            e += 1.5 * (1 - np.cos(q - 2.53))
+            energy += -0.8 * np.cos(p + 1.05) + 0.4 * np.cos(2 * p) + 1.5 * (1 - np.cos(q - 2.53))
+            if return_grad:
+                grad_phi[k] = 0.8 * np.sin(p + 1.05) - 0.8 * np.sin(2 * p)
+                grad_psi[k] = 1.5 * np.sin(q - 2.53)
         else:
-            # General residue: two-well potential (αR and β basins)
+            # General residue: three-well potential (αR, β, and ppII basins)
+            # e = -log(sum_i w_i * exp(-E_i))
+            # de/dp = (sum_i w_i * exp(-E_i) * dE_i/dp) / (sum_i w_i * exp(-E_i))
+
             e_alpha = (p + 1.05) ** 2 / (2 * 0.35 ** 2) + (q + 0.79) ** 2 / (2 * 0.35 ** 2)
             e_beta = (p + 2.09) ** 2 / (2 * 0.50 ** 2) + (q - 2.27) ** 2 / (2 * 0.40 ** 2)
             e_ppii = (p + 1.31) ** 2 / (2 * 0.40 ** 2) + (q - 2.53) ** 2 / (2 * 0.35 ** 2)
 
-            # Soft-minimum of Gaussian wells
-            e = -np.log(
-                np.exp(-e_alpha) * 0.40
-                + np.exp(-e_beta) * 0.30
-                + np.exp(-e_ppii) * 0.20
-                + 0.10 * np.exp(-3.0)  # background
-            )
+            w_a, w_b, w_p, w_bg = 0.40, 0.30, 0.20, 0.10
+            v_a = np.exp(-e_alpha)
+            v_b = np.exp(-e_beta)
+            v_p = np.exp(-e_ppii)
+            v_bg = np.exp(-3.0)
 
-        energy += e
+            z = w_a * v_a + w_b * v_b + w_p * v_p + w_bg * v_bg
+            energy += -np.log(z)
 
+            de_alpha_dp = (p + 1.05) / (0.35 ** 2)
+            de_beta_dp = (p + 2.09) / (0.50 ** 2)
+            de_ppii_dp = (p + 1.31) / (0.40 ** 2)
+
+            de_alpha_dq = (q + 0.79) / (0.35 ** 2)
+            de_beta_dq = (q - 2.27) / (0.40 ** 2)
+            de_ppii_dq = (q - 2.53) / (0.35 ** 2)
+
+            if return_grad:
+                grad_phi[k] = (w_a * v_a * de_alpha_dp + w_b * v_b * de_beta_dp + w_p * v_p * de_ppii_dp) / z
+                grad_psi[k] = (w_a * v_a * de_alpha_dq + w_b * v_b * de_beta_dq + w_p * v_p * de_ppii_dq) / z
+
+    if return_grad:
+        return energy, grad_phi, grad_psi
     return energy
 
 
@@ -727,11 +753,21 @@ class CoarseGrainedForceField:
             total_e += self.weights["hbond"] * hbond_energy_dssp(backbone)
             total_e += self.weights["cb_contact"] * cb_contact_energy(backbone, sequence)
 
-        # 7. Torsion (No Grad, requires phi/psi)
+        # 7. Torsion (Grad, requires phi/psi)
+        t_grad_phi = np.zeros_like(phi) if phi is not None else None
+        t_grad_psi = np.zeros_like(psi) if psi is not None else None
         if phi is not None and psi is not None:
-            total_e += self.weights["torsion"] * torsional_energy(phi, psi, sequence)
+            if return_grad:
+                val, g_phi, g_psi = torsional_energy(phi, psi, sequence, return_grad=True)
+                total_e += self.weights["torsion"] * val
+                t_grad_phi = self.weights["torsion"] * g_phi
+                t_grad_psi = self.weights["torsion"] * g_psi
+            else:
+                total_e += self.weights["torsion"] * torsional_energy(phi, psi, sequence)
 
         if return_grad:
+            if phi is not None and psi is not None:
+                return total_e, total_grad, t_grad_phi, t_grad_psi
             return total_e, total_grad
         return total_e
 

@@ -194,29 +194,46 @@ class FragmentLibrary:
             internal_energy=base_energy, bin_indices=[0] * k,
         ))
 
-        # 2. Random perturbations from the base SS conformation
+        # 2. Canonical structural conformations (regardless of SS prediction)
+        for angles in [(-1.05, -0.79), (-2.25, 2.35), (-1.22, 2.53)]:
+            phi = np.full(k, angles[0])
+            psi = np.full(k, angles[1])
+            ca = build_ca_trace(phi, psi)
+            e = ramachandran_score(phi, psi, frag_seq)
+            conformations.append(FragmentConformation(
+                phi=phi, psi=psi, ca_coords=ca,
+                internal_energy=e, bin_indices=[0] * k,
+            ))
+
+        # 3. Random perturbations with varying diversity
         rng = np.random.default_rng(hash(frag_seq) % (2**31))
-        n_random = min(self.max_conformations * 3, 200)
+        n_random = min(self.max_conformations * 5, 400)
 
         for _ in range(n_random):
-            # Perturb each angle by a small amount
-            phi_pert = base_phi + rng.normal(0, 0.3, k)
-            psi_pert = base_psi + rng.normal(0, 0.3, k)
+            # Choose a base: either SS-guided or one of the canonicals
+            base_idx = rng.integers(0, len(conformations))
+            b_phi = conformations[base_idx].phi
+            b_psi = conformations[base_idx].psi
 
-            # Clip to [-pi, pi]
-            phi_pert = np.clip(phi_pert, -np.pi, np.pi)
-            psi_pert = np.clip(psi_pert, -np.pi, np.pi)
+            # Diversity: some small perturbations, some larger
+            scale = rng.choice([0.1, 0.3, 0.6])
+            phi_pert = b_phi + rng.normal(0, scale, k)
+            psi_pert = b_psi + rng.normal(0, scale, k)
+
+            # Periodic wrap-around for angles
+            phi_pert = (phi_pert + np.pi) % (2 * np.pi) - np.pi
+            psi_pert = (psi_pert + np.pi) % (2 * np.pi) - np.pi
 
             ca = build_ca_trace(phi_pert, psi_pert)
             e = ramachandran_score(phi_pert, psi_pert, frag_seq)
-            e += clash_energy(ca) * 5.0  # penalise clashes
+            e += clash_energy(ca) * 10.0  # penalise clashes more heavily
 
             conformations.append(FragmentConformation(
                 phi=phi_pert, psi=psi_pert, ca_coords=ca,
                 internal_energy=e, bin_indices=[-1] * k,
             ))
 
-        # 3. Canonical Ramachandran bin conformations
+        # 4. Canonical Ramachandran bin conformations
         bins = ramachandran_bins(self.n_rama_bins)
         n_bins_total = len(bins)
 
